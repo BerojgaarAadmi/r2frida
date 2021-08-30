@@ -1,7 +1,7 @@
 include config.mk
 
 r2_version=$(VERSION)
-frida_version=14.2.18
+frida_version=15.0.16
 
 ifeq ($(strip $(frida_os)),)
 ifeq ($(shell uname -o 2> /dev/null),Android)
@@ -43,6 +43,7 @@ else
 LDFLAGS+=$(shell pkg-config --libs r_core r_io r_util)
 endif
 R2_PLUGDIR=$(shell r2 -H R2_USER_PLUGINS)
+R2_PLUGSYS=$(shell r2 -H R2_LIBR_PLUGINS)
 ifeq ($(R2_PLUGDIR),)
 r2:
 	@echo Please install r2
@@ -128,7 +129,12 @@ r2-sdk-ios/$(r2_version):
 	mv r2-sdk-ios/*/* r2-sdk-ios
 	rm -f radare2-ios-arm64-$(r2_version).tar.gz
 
-.PHONY: ext/frida
+.PHONY: ext/frida asan
+
+asan:
+	$(MAKE) clean
+	$(MAKE) USE_ASAN=1
+
 
 ext/swift-frida/index.js: .gitmodules node_modules
 	git submodule update --init
@@ -225,16 +231,31 @@ mrproper: clean
 	$(RM) ext/frida
 	$(RM) -r ext/node
 
-install:
+# user wide
+
+user-install:
 	mkdir -p $(DESTDIR)/"$(R2_PLUGDIR)"
 	cp -f io_frida.$(SO_EXT)* $(DESTDIR)/"$(R2_PLUGDIR)"
 
-symstall:
-	mkdir -p $(DESTDIR)/"$(R2_PLUGDIR)"
+user-uninstall:
+	$(RM) "$(DESTDIR)/$(R2_PLUGDIR)/io_frida.$(SO_EXT)"
+
+user-symstall:
+	mkdir -p "$(DESTDIR)/$(R2_PLUGDIR)"
 	ln -fs $(shell pwd)/io_frida.$(SO_EXT)* $(DESTDIR)/"$(R2_PLUGDIR)"
 
+# system wide
+
+install:
+	mkdir -p "$(DESTDIR)/$(R2_PLUGSYS)"
+	cp -f io_frida.$(SO_EXT)* $(DESTDIR)/"$(R2_PLUGSYS)"
+
+symstall:
+	mkdir -p "$(DESTDIR)/$(R2_PLUGSYS)"
+	ln -fs $(shell pwd)/io_frida.$(SO_EXT)* $(DESTDIR)/"$(R2_PLUGSYS)"
+
 uninstall:
-	$(RM) $(DESTDIR)/"$(R2_PLUGDIR)/io_frida.$(SO_EXT)"
+	$(RM) "$(DESTDIR)/$(R2_PLUGSYS)/io_frida.$(SO_EXT)"
 
 release:
 	$(MAKE) android STRIP_SYMBOLS=yes

@@ -91,7 +91,10 @@ function javaTraceExample () {
 const commandHandlers = {
   E: evalNum,
   '?e': echo,
+  '?E': uiAlert,
   '/': search,
+  '/i': searchInstances,
+  '/ij': searchInstancesJson,
   '/j': searchJson,
   '/x': searchHex,
   '/xj': searchHexJson,
@@ -127,7 +130,7 @@ const commandHandlers = {
   ieq: listEntrypointQuiet,
   'ie*': listEntrypointR2,
   iej: listEntrypointJson,
-
+  afs: analFunctionSignature,
   ii: listImports,
   'ii*': listImportsR2,
   iij: listImportsJson,
@@ -185,6 +188,11 @@ const commandHandlers = {
   'fd*': lookupAddressR2,
   fdj: lookupAddressJson,
   ic: listClasses,
+  ich: listClassesHooks,
+  icw: listClassesWhere,
+  icv: listClassVariables,
+  ics: listClassSuperMethods,
+  ica: listClassesAllMethods,
   icn: listClassesNatives,
   icL: listClassesLoaders,
   icl: listClassesLoaded,
@@ -207,7 +215,7 @@ const commandHandlers = {
   'dm.': listMemoryRangesHere,
   dmm: listMemoryMaps,
   'dmm*': listMemoryMapsR2,
-  'dmm.': listMemoryRangesHere, // alias for 'dm.'
+  'dmm.': listMemoryMapsHere, // alias for 'dm.'
   dmh: listMallocRanges,
   'dmh*': listMallocRangesR2,
   dmhj: listMallocRangesJson,
@@ -219,6 +227,7 @@ const commandHandlers = {
   'dma-': removeAlloc,
   dp: getPid,
   dxc: dxCall,
+  dxo: dxObjc,
   dxs: dxSyscall,
   dpj: getPidJson,
   dpt: listThreads,
@@ -258,11 +267,19 @@ const commandHandlers = {
   dtsfj: stalkTraceFunctionJson,
   'dtsf*': stalkTraceFunctionR2,
   di: interceptHelp,
+  dif: interceptHelp,
+  // intercept ret after calling function
   dis: interceptRetString,
   di0: interceptRet0,
   di1: interceptRet1,
   dii: interceptRetInt,
   'di-1': interceptRet_1,
+  // intercept ret and dont call the function
+  difs: interceptFunRetString,
+  dif0: interceptFunRet0,
+  dif1: interceptFunRet1,
+  difi: interceptFunRetInt,
+  'dif-1': interceptFunRet_1,
   // unix compat
   pwd: getCwd,
   cd: chDir,
@@ -408,19 +425,11 @@ function dxSyscall (args) {
   return dxCall(['syscall', syscallNumber, ...args.slice(1)]);
 }
 
-function dxCall (args) {
+function autoType (args) {
   const nfArgs = [];
   const nfArgsData = [];
-  if (args.length === 0) {
-    return `
-Usage: dxc [funcptr] [arg0 arg1..]
-For example:
- =!dxc write 1 "hello\\n" 6
- =!dxc read 0 \`?v rsp\` 10
-`;
-  }
   // push arguments
-  for (let i = 1; i < args.length; i++) {
+  for (let i = 0; i < args.length; i++) {
     if (args[i].substring(0, 2) === '0x') {
       nfArgs.push('pointer');
       nfArgsData.push(ptr(args[i]));
@@ -430,6 +439,12 @@ For example:
       const str = args[i].substring(1, args[i].length - 1);
       const buf = Memory.allocUtf8String(str.replace(/\\n/g, '\n'));
       nfArgsData.push(buf);
+    } else if (args[i].endsWith('f')) {
+      nfArgs.push('float');
+      nfArgsData.push(0.0 + args[i]);
+    } else if (args[i].endsWith('F')) {
+      nfArgs.push('double');
+      nfArgsData.push(0.0 + args[i]);
     } else if (+args[i] > 0 || args[i] === '0') {
       nfArgs.push('int');
       nfArgsData.push(+args[i]);
@@ -439,9 +454,63 @@ For example:
       nfArgsData.push(address);
     }
   }
+  return [nfArgs, nfArgsData];
+}
+
+function dxObjc (args) {
+  if (!ObjCAvailable) {
+    return 'dxo requires the objc runtime to be available to work.';
+  }
+  if (args.length === 0) {
+    return 'Usage: dxo [klassname|instancepointer] [methodname] [args...]';
+  }
+  if (args.length === 1) {
+    return listClasses(args);
+  }
+  // Usage: "dxo instance-pointer [arg0 arg1]"
+  let instancePointer = null;
+  if (args[0].startsWith('0x')) {
+    instancePointer = new ObjC.Object(ptr(args[0]));
+  } else {
+    const klassName = args[0];
+    if (!ObjC.classes[klassName]) {
+      return 'Cannot find objc class ' + klassName;
+    }
+    const instances = ObjC.chooseSync(ObjC.classes[klassName]);
+    if (!instances) {
+      return 'Cannot find any instance for klass ' + klassName;
+    }
+    instancePointer = instances[0];
+  }
+  const methodName = args[1];
+  const [v, t] = autoType(args.slice(2));
+  try {
+    ObjC.schedule(ObjC.mainQueue, function () {
+      if (instancePointer.hasOwnProperty(methodName)) {
+        instancePointer[methodName](...t);
+      } else {
+        console.error('unknown method ' + methodName + ' for objc instance at ' + padPointer(ptr(instancePointer)));
+      }
+    });
+  } catch (e) {
+    console.error(e);
+  }
+  return '';
+}
+
+function dxCall (args) {
+  if (args.length === 0) {
+    return `
+Usage: dxc [funcptr] [arg0 arg1..]
+For example:
+ =!dxc write 1 "hello\\n" 6
+ =!dxc read 0 \`?v rsp\` 10
+`;
+  }
   const address = (args[0].substring(0, 2) === '0x')
     ? ptr(args[0])
     : Module.getExportByName(null, args[0]);
+  const [nfArgs, nfArgsData] = autoType(args.slice(1));
   const fun = new NativeFunction(address, 'pointer', nfArgs);
   if (nfArgs.length === 0) {
     return fun();
@@ -502,7 +571,7 @@ function disasm (addr, len, initialOldName) {
       dsName = '';
     }
     if ((moduleName || dsName) && dsName !== oldName) {
-      disco += ';;; ' + (moduleName ? moduleName : dsName) + '\n';
+      disco += ';;; ' + (moduleName || dsName) + '\n';
       oldName = dsName;
     }
     let comment = '';
@@ -658,7 +727,7 @@ function breakpointUnset (args) {
 */
     const symbol = Module.findExportByName(null, args[0]);
     const arg0 = args[0];
-    const addr = arg0 == '*' ? ptr(0) : (symbol !== null) ? symbol : ptr(arg0);
+    const addr = arg0 === '*' ? ptr(0) : (symbol !== null) ? symbol : ptr(arg0);
     const newbps = [];
     let found = false;
     for (const k of Object.keys(breakpoints)) {
@@ -735,7 +804,7 @@ function radareCommandString (cmd) {
 
 function radareSeek (args) {
   const addr = getPtr('' + args);
-  const cmdstr = 's  ' + (addr || '' + args);
+  const cmdstr = 's ' + (addr || '' + args);
   return cmdstr;
   // XXX hangs
   // return hostCmd(cmdstr);
@@ -956,12 +1025,21 @@ async function dumpInfoJson () {
         const v = id.objectForKey_(k);
         return v ? v.toString() : '';
       }
+      const NSHomeDirectory = new NativeFunction(
+        Module.getExportByName(null, 'NSHomeDirectory'),
+        'pointer', []);
+      const NSTemporaryDirectory = new NativeFunction(
+        Module.getExportByName(null, 'NSTemporaryDirectory'),
+        'pointer', []);
       res.bundle = get('CFBundleIdentifier');
       res.exename = get('CFBundleExecutable');
       res.appname = get('CFBundleDisplayName');
       res.appversion = get('CFBundleShortVersionString');
       res.appnumversion = get('CFBundleNumericVersion');
-      res.apphome = ObjC.classes.NSBundle.mainBundle().bundleURL().path();
+      res.homedir = (new ObjC.Object(NSHomeDirectory()).toString());
+      res.tmpdir = (new ObjC.Object(NSTemporaryDirectory()).toString());
+      res.bundledir = ObjC.classes.NSBundle.mainBundle().bundleURL().path();
+      // res.appdata = ObjC.classes.NSBundle.mainBundle().bundleURL().path();
       res.minOS = get('MinimumOSVersion');
     } catch (e) {
       console.error(e);
@@ -1408,6 +1486,44 @@ function listEntrypoint (args) {
     }).join('\n');
 }
 
+function analFunctionSignature (args) {
+  if (!ObjCAvailable) {
+    return 'Error: afs is only implemented for ObjC methods.';
+  }
+  if (args.length === 0) {
+    return 'Usage: afs [class] [method]';
+  }
+  if (args.length === 1) {
+    return listClasses(args);
+  }
+  if (args.length > 1) {
+    const klassName = args[0];
+    const methodName = args[1].replace(/:/g, '_');
+    const klass = ObjC.classes[klassName];
+    if (!klass) {
+      // try to resolve from DebugSymbol
+      const at = klassName.startsWith('0x')
+        ? DebugSymbol.fromAddress(ptr(klassName))
+        : DebugSymbol.fromName(klassName);
+      if (at) {
+        return JSON.stringify(at);
+      }
+      return 'Cannot find class named ' + klassName;
+    }
+    // const instance = ObjC.chooseSync(ObjC.classes[klassName])[0];
+    const instance = ObjC.chooseSync(klass)[0];
+    if (!instance) {
+      return 'Cannot find any instance for ' + klassName;
+    }
+    const method = instance[methodName];
+    if (!method) {
+      return 'Cannot find method ' + methodName + ' for class ' + klassName;
+    }
+    return method.returnType + ' (' + method.argumentTypes.join(', ') + ');';
+  }
+  return 'Usage: afs [klassName] [methodName]';
+}
+
 function listImports (args) {
   return listImportsJson(args)
     .map(({ type, name, module, address }) => [address, type ? type[0] : ' ', name, module].join(' '))
@@ -1570,6 +1686,93 @@ function listClassesNatives (args) {
   return natives;
 }
 
+function listClassesAllMethods (args) {
+  return listClassesJson(args, 'all').join('\n');
+}
+
+function listClassSuperMethods (args) {
+  return listClassesJson(args, 'super').join('\n');
+}
+
+function listClassVariables (args) {
+  return listClassesJson(args, 'ivars').join('\n');
+}
+
+function listClassesHooks (args, mode) {
+  let out = '';
+  if (args.length === 0) {
+    return 'Usage: :ich [kw]';
+  }
+  const moduleNames = {};
+  const result = listClassesJson([]);
+  if (ObjCAvailable) {
+    const klasses = ObjC.classes;
+    for (const k of result) {
+      moduleNames[k] = ObjC.classes[k].$moduleName;
+    }
+  }
+  for (const k of result) {
+    const modName = moduleNames[k];
+    if (k.indexOf(args[0]) !== -1 || (modName && modName.indexOf(args[0]) !== -1)) {
+      const ins = searchInstancesJson([k]);
+      const inss = ins.map((x) => { return x.address; }).join(' ');
+      const a = 'OOO';
+      const klass = ObjC.classes[k];
+      if (klass) {
+        for (const m of klass.$ownMethods) {
+          // TODO: use instance.argumentTypes to generate the 'OOO'
+          out += ':dtf objc:' + k + '.' + m + ' ' + a + '\n';
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function listClassesWhere (args, mode) {
+  let out = '';
+  if (args.length === 0) {
+    const moduleNames = {};
+    const result = listClassesJson([]);
+    if (ObjCAvailable) {
+      const klasses = ObjC.classes;
+      for (const k of result) {
+        moduleNames[k] = klasses[k].$moduleName;
+      }
+    }
+    for (const klass of result) {
+      const modName = moduleNames[klass];
+      out += [modName, klass].join(' ') + '\n';
+    }
+    return out;
+  } else {
+    const moduleNames = {};
+    const result = listClassesJson([]);
+    if (ObjCAvailable) {
+      const klasses = ObjC.classes;
+      for (const k of result) {
+        moduleNames[k] = ObjC.classes[k].$moduleName;
+      }
+    }
+    for (const k of result) {
+      const modName = moduleNames[k];
+      if (modName && modName.indexOf(args[0]) != -1) {
+        const ins = searchInstancesJson([k]);
+        const inss = ins.map((x) => { return x.address; }).join(' ');
+        out += k + ' # ' + inss + '\n';
+        if (mode === 'ivars') {
+          for (const a of ins) {
+            out += 'instance ' + padPointer(a.address) + '\n';
+            const i = new ObjC.Object(ptr(a.address));
+            out += (JSON.stringify(i.$ivars)) + '\n';
+          }
+        }
+      }
+    }
+    return out;
+  }
+}
+
 function listClasses (args) {
   const result = listClassesJson(args);
   if (result instanceof Array) {
@@ -1695,16 +1898,16 @@ function listJavaClassesJson (args, classMethodsOnly) {
 }
 
 function listClassMethods (args) {
-  return listClassesJson(args, true).join('\n');
+  return listClassesJson(args, 'methods').join('\n');
 }
 
 function listClassMethodsJson (args) {
-  return listClassesJson(args, true);
+  return listClassesJson(args, 'methods');
 }
 
-function listClassesJson (args, classMethods) {
+function listClassesJson (args, mode) {
   if (JavaAvailable) {
-    return listJavaClassesJson(args, classMethods === true);
+    return listJavaClassesJson(args, mode === 'methods');
   }
   if (!ObjCAvailable) {
     return [];
@@ -1715,18 +1918,41 @@ function listClassesJson (args, classMethods) {
   const klassName = args[0];
   const klass = ObjC.classes[klassName];
   if (klass === undefined) {
-    throw new Error('Class ' + args[0] + ' not found');
+    throw new Error('Class ' + klassName + ' not found');
   }
+  let out = '';
+  if (mode === 'ivars') {
+    const ins = searchInstancesJson([klassName]);
+    out += klassName + ': ';
+    for (const i of ins) {
+      out += 'instance ' + padPointer(ptr(i.address)) + ': ';
+      const ii = new ObjC.Object(ptr(i.address));
+      out += JSON.stringify(ii.$ivars, null, '  ');
+    }
+    return [out];
+  }
+  const methods =
+(mode === 'methods')
+  ? klass.$ownMethods
+  : (mode === 'super')
+      ? klass.$super.$ownMethods
+      : (mode === 'all')
+          ? klass.$methods
+          : klass.$ownMethods;
   const getImpl = ObjC.api.method_getImplementation;
-  return klass.$ownMethods
-    .reduce((result, methodName) => {
-      try {
-        result[methodName] = getImpl(klass[methodName].handle);
-      } catch (_) {
-        console.log('warning: unsupported method \'' + methodName + '\' in ' + klassName);
-      }
-      return result;
-    }, {});
+  try {
+    return methods
+      .reduce((result, methodName) => {
+        try {
+          result[methodName] = getImpl(klass[methodName].handle);
+        } catch (_) {
+          console.error('warning: unsupported method \'' + methodName + '\' in ' + klassName);
+        }
+        return result;
+      }, {});
+  } catch (e) {
+    return methods;
+  }
 }
 
 function listProtocols (args) {
@@ -1886,6 +2112,25 @@ function listMallocRanges (args) {
     .map(_ => '' + _.base + ' - ' + _.base.add(_.size) + '  (' + _.size + ')').join('\n') + '\n';
 }
 
+function listMemoryMapsHere (args) {
+  if (args.length !== 1) {
+    args = [ptr(r2frida.offset)];
+  }
+  const addr = ptr(args[0]);
+  return squashRanges(listMemoryRangesJson())
+    .filter(({ base, size }) => addr.compare(base) >= 0 && addr.compare(base.add(size)) < 0)
+    .map(({ base, size, protection, file }) => {
+      return [
+        padPointer(base),
+        '-',
+        padPointer(base.add(size)),
+        protection,
+        file.path
+      ].join(' ');
+    })
+    .join('\n') + '\n';
+}
+
 function listMemoryRangesHere (args) {
   if (args.length !== 1) {
     args = [ptr(r2frida.offset)];
@@ -1920,7 +2165,6 @@ function rwxint (x) {
 }
 
 function squashRanges (ranges) {
-// console.log("SquashRanges");
   const res = [];
   let begin = ptr(0);
   let end = ptr(0);
@@ -1928,9 +2172,6 @@ function squashRanges (ranges) {
   let lastFile = '';
   for (const r of ranges) {
     lastPerm |= rwxint(r.protection);
-    if (r.file) {
-      lastFile = r.file;
-    }
     // console.log("-", r.base, range.base.add(range.size));
     if (r.base.equals(end)) {
       // enlarge segment
@@ -1954,6 +2195,9 @@ function squashRanges (ranges) {
         lastPerm = 0;
         lastFile = '';
       }
+    }
+    if (r.file) {
+      lastFile = r.file;
     }
   }
   if (!begin.equals(ptr(0))) {
@@ -2096,59 +2340,59 @@ function listThreadsJson () {
 function regProfileAliasFor (arch) {
   switch (arch) {
     case 'arm64':
-      return `=PC	pc
-=SP	sp
-=BP	x29
-=A0	x0
-=A1	x1
-=A2	x2
-=A3	x3
-=ZF	zf
-=SF	nf
-=OF	vf
-=CF	cf
-=SN	x8
+      return `=PC pc
+=SP sp
+=BP x29
+=A0 x0
+=A1 x1
+=A2 x2
+=A3 x3
+=ZF zf
+=SF nf
+=OF vf
+=CF cf
+=SN x8
 `;
     case 'arm':
-      return `=PC	r15
-=LR	r14
-=SP	sp
-=BP	fp
-=A0	r0
-=A1	r1
-=A2	r2
-=A3	r3
-=ZF	zf
-=SF	nf
-=OF	vf
-=CF	cf
-=SN	r7
+      return `=PC r15
+=LR r14
+=SP sp
+=BP fp
+=A0 r0
+=A1 r1
+=A2 r2
+=A3 r3
+=ZF zf
+=SF nf
+=OF vf
+=CF cf
+=SN r7
 `;
     case 'ia64':
     case 'x64':
-      return `=PC	rip
-=SP	rsp
-=BP	rbp
-=A0	rdi
-=A1	rsi
-=A2	rdx
-=A3	rcx
-=A4	r8
-=A5	r9
-=SN	rax
+      return `=PC rip
+=SP rsp
+=BP rbp
+=A0 rdi
+=A1 rsi
+=A2 rdx
+=A3 rcx
+=A4 r8
+=A5 r9
+=SN rax
 `;
     case 'ia32':
     case 'x86':
-      return `=PC	eip
-=SP	esp
-=BP	ebp
-=A0	eax
-=A1	ebx
-=A2	ecx
-=A3	edx
-=A4	esi
-=A5	edi
-=SN	eax
+      return `=PC eip
+=SP esp
+=BP ebp
+=A0 eax
+=A1 ebx
+=A2 ecx
+=A3 edx
+=A4 esi
+=A5 edi
+=SN eax
 `;
   }
   return '';
@@ -2527,8 +2771,8 @@ function cloneArgs (args, fmt) {
 
 function _hexdumpUntrusted (addr, len) {
   try {
-	  if (typeof len === 'number') return hexdump(addr, { length: len });
-	  else return hexdump(addr);
+    if (typeof len === 'number') return hexdump(addr, { length: len });
+    else return hexdump(addr);
   } catch (e) {
     return `hexdump at ${addr} failed: ${e}`;
   }
@@ -2664,6 +2908,7 @@ function traceFormat (args) {
   }
   const traceOnEnter = format.indexOf('^') !== -1;
   const traceBacktrace = format.indexOf('+') !== -1;
+  const useCmd = config.getString('hook.usecmd');
 
   const currentModule = getModuleByAddress(address);
   const listener = Interceptor.attach(ptr(address), {
@@ -2703,11 +2948,14 @@ function traceFormat (args) {
           for (let i = 0; i < this.myDumps.length; i++) msg += `\ndump:${i + 1}\n${this.myDumps[i]}`;
           traceEmit(msg);
         }
+        if (useCmd.length > 0) {
+          console.log('[r2cmd]' + useCmd);
+        }
       }
     },
     onLeave: function (retval) {
       if (!traceOnEnter) {
-   		const fa = formatArgs(this.keepArgs, format);
+        const fa = formatArgs(this.keepArgs, format);
         this.myArgs = fa.args;
         this.myDumps = fa.dumps;
 
@@ -2731,6 +2979,9 @@ function traceFormat (args) {
           }
           for (let i = 0; i < this.myDumps.length; i++) msg += `\ndump:${i + 1}\n${this.myDumps[i]}`;
           traceEmit(msg);
+        }
+        if (useCmd.length > 0) {
+          console.log('[r2cmd]' + useCmd);
         }
       }
     }
@@ -2805,9 +3056,11 @@ function objectToString (o) {
 
 function tracelogToString (l) {
   const line = [l.source, l.name || l.address, objectToString(l.values)].join('\t');
-  const bt = (!l.backtrace) ? '' : l.backtrace.map((b) => {
-    return ['', b.address, b.moduleName, b.name].join('\t');
-  }).join('\n') + '\n';
+  const bt = (!l.backtrace)
+    ? ''
+    : l.backtrace.map((b) => {
+      return ['', b.address, b.moduleName, b.name].join('\t');
+    }).join('\n') + '\n';
   return line + bt;
 }
 
@@ -2992,7 +3245,8 @@ function traceJava (klass, method) {
     k[method].implementation = function (args) {
       const res = this[method]();
       const bt = config.getBoolean('hook.backtrace')
-        ? Throwable.$new().getStackTrace().map(_ => _.toString()) : [];
+        ? Throwable.$new().getStackTrace().map(_ => _.toString())
+        : [];
       const traceMessage = {
         source: 'dt',
         klass: klass,
@@ -3202,8 +3456,11 @@ function clearTrace (args) {
 }
 
 function interceptHelp (args) {
-  return 'Usage: di0, di1 or di-1 passing as argument the address to intercept';
+  return 'Usage: di[f][0,1,-1,s] [addr] : intercept function before/after calling and replace return value\n';
+  'dif0 0x808080  # when program calls this address, dont run the function and return 0\n';
 }
+
+/* Intercept function calls *after* calling the original function code */
 
 function interceptRetJava (klass, method, value) {
   javaPerform(function () {
@@ -3279,6 +3536,46 @@ function interceptRet_1 (args) { // eslint-disable-line
   return interceptRet(target, -1);
 }
 
+/* Intercept function calls *before* calling the original function code */
+function interceptFunRet (target, value) {
+  if (target.startsWith('java:')) {
+    return 'TODO: not yet implemented';
+  }
+  const p = getPtr(target);
+  const useCmd = config.getString('hook.usecmd');
+  Interceptor.replace(p, new NativeCallback(function () {
+    if (useCmd.length > 0) {
+      console.log('[r2cmd]' + useCmd);
+    }
+    return ptr(value);
+  }, 'pointer', ['pointer']));
+}
+
+function interceptFunRet0 (args) {
+  const target = args[0];
+  return interceptFunRet(target, 0);
+}
+
+function interceptFunRetString (args) {
+  const target = args[0];
+  return interceptFunRet(target, args[1]);
+}
+
+function interceptFunRetInt (args) {
+  const target = args[0];
+  return interceptFunRet(target, args[1]);
+}
+
+function interceptFunRet1 (args) {
+  const target = args[0];
+  return interceptFunRet(target, 1);
+}
+
+function interceptFunRet_1 (args) { // eslint-disable-line
+  const target = args[0];
+  return interceptFunRet(target, -1);
+}
+
 function getenv (name) {
   return Memory.readUtf8String(_getenv(Memory.allocUtf8String(name)));
 }
@@ -3293,8 +3590,10 @@ function getWindowsUserNameA () {
   const buf = Memory.allocUtf8String('A'.repeat(PATH_MAX));
   const char_out = Memory.allocUtf8String('A'.repeat(PATH_MAX));
   const res = _GetUserNameA(buf, char_out);
-  const user = Memory.readCString(buf);
-  return user;
+  if (res) {
+    return Memory.readCString(buf);
+  }
+  return '';
 }
 
 function stalkTraceFunction (args) {
@@ -3649,7 +3948,8 @@ function perform (params) {
   }
   const userHandler = global.r2frida.commandHandler(name);
   const handler = userHandler !== undefined
-    ? userHandler : commandHandlers[name];
+    ? userHandler
+    : commandHandlers[name];
   if (handler === undefined) {
     throw new Error('Unhandled command: ' + name);
   }
@@ -3764,6 +4064,95 @@ function fridaVersion () {
   return { version: Frida.version };
 }
 
+function uiAlertAndroid (args) {
+  if (args.length < 2) {
+    return 'Usage: ?E title message';
+  }
+  const title = args[0];
+  const message = args.slice(1).join(' ');
+  Java.perform(function () {
+    const System = Java.use('java.lang.System');
+    const ActivityThread = Java.use('android.app.ActivityThread');
+    const AlertDialogBuilder = Java.use('android.app.AlertDialog$Builder');
+    const DialogInterfaceOnClickListener = Java.use('android.content.DialogInterface$OnClickListener');
+
+    Java.use('android.app.Activity').onCreate.overload('android.os.Bundle').implementation = function (savedInstanceState) {
+      const currentActivity = this;
+
+      // Get Main Activity
+      const application = ActivityThread.currentApplication();
+      const launcherIntent = application.getPackageManager().getLaunchIntentForPackage(application.getPackageName());
+      const launchActivityInfo = launcherIntent.resolveActivityInfo(application.getPackageManager(), 0);
+
+      // Alert Will Only Execute On Main Package Activity Creation
+      if (launchActivityInfo.name.value === this.getComponentName().getClassName()) {
+        const alert = AlertDialogBuilder.$new(this);
+        alert.setMessage(title + message); // "What you want to do now?");
+
+        /*
+            alert.setPositiveButton("Dismiss", Java.registerClass({
+                name: 'il.co.realgame.OnClickListenerPositive',
+                implements: [DialogInterfaceOnClickListener],
+                methods: {
+                    getName: function() {
+                        return 'OnClickListenerPositive';
+                    },
+                    onClick: function(dialog, which) {
+                        // Dismiss
+                        dialog.dismiss();
+                    }
+                }
+            }).$new());
+
+            alert.setNegativeButton("Force Close!", Java.registerClass({
+                name: 'il.co.realgame.OnClickListenerNegative',
+                implements: [DialogInterfaceOnClickListener],
+                methods: {
+                    getName: function() {
+                        return 'OnClickListenerNegative';
+                    },
+                    onClick: function(dialog, which) {
+                        // Close Application
+                        currentActivity.finish();
+                        System.exit(0);
+                    }
+                }
+            }).$new());
+
+*/
+        // Create Alert
+        alert.create().show();
+      }
+      return this.onCreate.overload('android.os.Bundle').call(this, savedInstanceState);
+    };
+  });
+}
+
+function uiAlert (args) {
+  if (JavaAvailable) {
+    return uiAlertAndroid(args);
+  }
+  if (!ObjCAvailable) {
+    return 'Error: ui-alert is not implemented for this platform';
+  }
+  if (args.length < 2) {
+    return 'Usage: ?E title message';
+  }
+  const title = args[0];
+  const message = args.slice(1).join(' ');
+  ObjC.schedule(ObjC.mainQueue, function () {
+    const UIAlertView = ObjC.classes.UIAlertView; /* iOS 7 */
+    const view = UIAlertView.alloc().initWithTitle_message_delegate_cancelButtonTitle_otherButtonTitles_(
+      title,
+      message,
+      NULL,
+      'OK',
+      NULL);
+    view.show();
+    view.release();
+  });
+}
+
 function search (args) {
   return searchJson(args).then(hits => {
     return _readableHits(hits);
@@ -3790,6 +4179,27 @@ function searchJson (args) {
     });
     return hits.filter(hit => hit.content !== undefined);
   });
+}
+
+function searchInstancesJson (args) {
+  const className = args.join('');
+  if (ObjCAvailable) {
+    const results = JSON.parse(JSON.stringify(ObjC.chooseSync(ObjC.classes[className])));
+    return results.map(function (res) {
+      return { address: res.handle, content: className };
+    });
+  } else {
+    Java.performNow(function () {
+      const results = Java.choose(Java.classes[className]);
+      return results.map(function (res) {
+        return { address: res, content: className };
+      });
+    });
+  }
+}
+
+function searchInstances (args) {
+  return _readableHits(searchInstancesJson(args));
 }
 
 function searchHex (args) {
@@ -3871,7 +4281,8 @@ function evalConfig (args) {
   if (args.length === 0) {
     return config.asR2Script();
   }
-  const kv = args[0].split(/=/);
+  const argstr = args.join(' ');
+  const kv = argstr.split(/=/);
   const [k, v] = kv;
   if (kv.length === 2) {
     if (config.get(k) !== undefined) {
@@ -3880,18 +4291,21 @@ function evalConfig (args) {
         return config.helpFor(kv[0]);
       }
       // set (and flatten case for variables except file.log)
+      /*
       if (kv[0] !== 'file.log' && typeof kv[1] === 'string') {
         config.set(kv[0], kv[1].toLowerCase());
       } else {
         config.set(kv[0], kv[1]);
       }
+*/
+      config.set(kv[0], kv[1]);
     } else {
       console.error('unknown variable');
     }
     return '';
   }
   // get
-  return config.getString(args[0]);
+  return config.getString(argstr);
 }
 
 function _renderEndian (value, bigEndian, width) {
@@ -3936,7 +4350,7 @@ function _filterPrintable (arr) {
 
 function _readableHits (hits) {
   const output = hits.map(hit => {
-    if (hit.flag !== undefined) {
+    if (typeof hit.flag === 'string') {
       return `${hexPtr(hit.address)} ${hit.flag} ${hit.content}`;
     }
     return `${hexPtr(hit.address)} ${hit.content}`;

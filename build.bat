@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableDelayedExpansion
 set R2_BASE=""
-set frida_version=14.2.17
+set frida_version=15.0.16
 if "%PLATFORM%" == "x64" (set frida_os_arch=x86_64) else (set frida_os_arch=x86)
 for /f %%i in ('radare2 -H R2_USER_PLUGINS') do set R2_PLUGDIR=%%i
 REM for /f %%i in ('where radare2') do set R2_BASE=%%i\..
@@ -29,6 +29,7 @@ copy config.h.w64 config.h
 call npm install
 cd src
 cat .\_agent.js | xxd -i > .\_agent.h || (echo "xxd not in path?" & exit /b 1)
+REM radare2 -nfqcpc _agent.js | grep 0x > _agent.h || (echo "radare2.exe must be in path & exit /b 1)
 
 mkdir frida > nul 2>&1
 cd frida
