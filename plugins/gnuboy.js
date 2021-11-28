@@ -19,11 +19,31 @@ mute the audio and more to come!
 
 */
 
-
+function symptr(name) {
+  var p = Module.findExportByName(null, name);
+  if (p) {
+    return p;
+  }
+  // iterate over all modules and all the symbols
+  for (let m of Process.enumerateModules()) {
+    for (let s of m.enumerateSymbols()) {
+      if (s.name === name) {
+        return s.address
+      }
+    }
+  }
+  // on linux the symbols are not exported
+  p = DebugSymbol.findFunctionsNamed(name);
+  if (p && p.length > 0) {
+    return p[0];
+  }
+  throw new Error('Cannot find symbol');
+}
 
 function sym(name, ret, arg) {
   try {
-    return new NativeFunction(Module.findExportByName(null, name), ret, arg);
+    var p = symptr(name);
+    return new NativeFunction(p, ret, arg);
   } catch (e) {
     console.error(name, ':', e);
     return null;
@@ -52,7 +72,7 @@ const gnuboyWrite = sym('mem_write', 'void', ['int', 'uint8']);
 
 function hookedRead (offset, count) {
   var i = 0;
-  var data = []; // new ArrayBuffer(count);
+  var data = [];
   for (i = 0; i < count; i++) {
     data[i] = gnuboyRead(offset + i);
   }
@@ -61,7 +81,7 @@ function hookedRead (offset, count) {
 
 function hookedWrite (offset, data) {
   var i = 0;
-  var b = []; // new ArrayBuffer(data);
+  var b = [];
   for (i = 0; i < b.length; i++) {
     gnuboyWrite(offset + i, b[i]);
   }
@@ -69,7 +89,7 @@ function hookedWrite (offset, data) {
 };
 
 function showCpu() {
-  const cpu_addr = Module.findExportByName(null, 'cpu');
+  const cpu_addr = symptr('cpu');
   let r = '?e f cpu = ' + cpu_addr + '\n';
   r += 's '+cpu_addr+';pf wwwwwwxxxxxxxx pc sp bc de hl af ime ima speed halt div tim lcdc snd;s--\n'
   return r;
@@ -132,8 +152,8 @@ function cpuReset() {
 
 function clearScreen() {
   const clear_screen = sym('lcd_reset', 'void', []);
-  if (cpu_reset) {
-    cpu_reset();
+  if (clear_screen) {
+    clear_screen();
   }
 }
 

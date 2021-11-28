@@ -12,12 +12,10 @@ const isObjC = require('./isobjc');
 const strings = require('./strings');
 const utils = require('./utils');
 
-// registered as a plugin
-require('../../ext/swift-frida/examples/r2swida/index.js');
-
 let Gcwd = '/';
 
 /* ObjC.available is buggy on non-objc apps, so override this */
+const SwiftAvailable = Process.platform === 'darwin' && global.hasOwnProperty('Swift') && Swift.available;
 const ObjCAvailable = (Process.platform === 'darwin') && ObjC && ObjC.available && ObjC.classes && typeof ObjC.classes.NSString !== 'undefined';
 const NeedsSafeIo = (Process.platform === 'linux' && Process.arch === 'arm' && Process.pointerSize === 4);
 const JavaAvailable = Java && Java.available;
@@ -222,6 +220,7 @@ const commandHandlers = {
   dmhm: listMallocMaps,
   dma: allocSize,
   dmas: allocString,
+  dmaw: allocWstring,
   dmad: allocDup,
   dmal: listAllocs,
   'dma-': removeAlloc,
@@ -245,6 +244,8 @@ const commandHandlers = {
   'dlf-': unloadFrameworkBundle,
   dtf: traceFormat,
   dth: traceHook,
+  t: types,
+  't*': typesR2,
   dt: trace,
   dtj: traceJson,
   dtq: traceQuiet,
@@ -267,14 +268,15 @@ const commandHandlers = {
   dtsfj: stalkTraceFunctionJson,
   'dtsf*': stalkTraceFunctionR2,
   di: interceptHelp,
-  dif: interceptHelp,
-  // intercept ret after calling function
+  dif: interceptFunHelp,
+  // intercept ret function and dont call the function
   dis: interceptRetString,
   di0: interceptRet0,
   di1: interceptRet1,
   dii: interceptRetInt,
   'di-1': interceptRet_1,
-  // intercept ret and dont call the function
+  'div': interceptRetVoid,
+  // intercept ret after calling the function
   difs: interceptFunRetString,
   dif0: interceptFunRet0,
   dif1: interceptFunRet1,
@@ -301,11 +303,11 @@ async function initBasicInfoFromTarget (args) {
 e dbg.backend = io
 e anal.autoname=true
 e cmd.fcn.new=aan
-.=!ie*
-.=!dmm*
-.=!il*
+.:ie*
+.:dmm*
+.:il*
 m /r2f io 0
-s entry0
+s entry0 2> /dev/null
  `;
   return str;
 }
@@ -350,6 +352,15 @@ function allocString (args) {
     return _addAlloc(a);
   }
   throw new Error('Usage: dmas [string]');
+}
+
+function allocWstring (args) {
+  const theString = args.join(' ');
+  if (theString.length > 0) {
+    const a = Memory.allocUtf16String(theString);
+    return _addAlloc(a);
+  }
+  throw new Error('Usage: dmaw [string]');
 }
 
 function allocDup (args) {
@@ -503,8 +514,8 @@ function dxCall (args) {
     return `
 Usage: dxc [funcptr] [arg0 arg1..]
 For example:
- =!dxc write 1 "hello\\n" 6
- =!dxc read 0 \`?v rsp\` 10
+ :dxc write 1 "hello\\n" 6
+ :dxc read 0 \`?v rsp\` 10
 `;
   }
   const address = (args[0].substring(0, 2) === '0x')
@@ -779,7 +790,7 @@ function radareCommandInit () {
   if (!_r_core_new) {
     _r_core_new = sym('r_core_new', 'pointer', []);
     if (!_r_core_new) {
-      console.error('ERROR: Cannot find r_core_new. Do =!dl /tmp/libr.dylib');
+      console.error('ERROR: Cannot find r_core_new. Do :dl /tmp/libr.dylib');
       return false;
     }
     _r_core_cmd_str = sym('r_core_cmd_str', 'pointer', ['pointer', 'pointer']);
@@ -813,12 +824,12 @@ function radareSeek (args) {
 function radareCommand (args) {
   const cmd = args.join(' ');
   if (cmd.length === 0) {
-    return 'Usage: =!r [cmd]';
+    return 'Usage: :r [cmd]';
   }
   if (radareCommandInit()) {
     return radareCommandString(cmd);
   }
-  return '=!dl /tmp/libr.dylib';
+  return ':dl /tmp/libr.dylib';
 }
 
 function sendSignal (args) {
@@ -831,7 +842,7 @@ function sendSignal (args) {
     const [pid, sig] = args;
     _kill(+pid, +sig);
   } else {
-    return 'Usage: =!dk ([pid]) [sig]';
+    return 'Usage: :dk ([pid]) [sig]';
   }
   return '';
 }
@@ -853,7 +864,7 @@ function breakpointContinueUntil (args) {
 function breakpointContinue (args) {
   if (suspended) {
     suspended = false;
-    return hostCmd('=!dc');
+    return hostCmd(':dc');
   }
   let count = 0;
   for (const k of Object.keys(breakpoints)) {
@@ -1009,6 +1020,7 @@ async function dumpInfoJson () {
     uid: _getuid(),
     objc: ObjCAvailable,
     runtime: Script.runtime,
+    swift: SwiftAvailable,
     java: JavaAvailable,
     mainLoop: hasMainLoop(),
     pageSize: Process.pageSize,
@@ -1018,11 +1030,12 @@ async function dumpInfoJson () {
     cwd: getCwd(),
   };
 
-  if (ObjCAvailable) {
+  if (ObjCAvailable && !suspended) {
     try {
-      const id = ObjC.classes.NSBundle.mainBundle().infoDictionary();
+      const mb = (ObjC && ObjC.classes && ObjC.classes.NSBundle) ? ObjC.classes.NSBundle.mainBundle() : '';
+      const id = mb ? mb.infoDictionary() : '';
       function get (k) {
-        const v = id.objectForKey_(k);
+        const v = id ? id.objectForKey_(k) : '';
         return v ? v.toString() : '';
       }
       const NSHomeDirectory = new NativeFunction(
@@ -1176,7 +1189,7 @@ function listAllSymbolsJson (args) {
 }
 
 function listAllHelp (args) {
-  return 'See =!ia? for more information. Those commands may take a while to run.';
+  return 'See :ia? for more information. Those commands may take a while to run.';
 }
 
 function listAllSymbols (args) {
@@ -2288,7 +2301,7 @@ function _getMemoryRanges (protection) {
 async function changeMemoryProtection (args) {
   const [addr, size, protection] = args;
   if (args.length !== 3 || protection.length > 3) {
-    return 'Usage: =!dmp [address] [size] [rwx]';
+    return 'Usage: :dmp [address] [size] [rwx]';
   }
   const address = getPtr(addr);
   const mapsize = await numEval(size);
@@ -2712,6 +2725,14 @@ function formatArgs (args, fmt) {
         const s = _readUntrustedUtf8(arg);
         a.push(JSON.stringify(s));
         break;
+      case 'w': // *s
+        const sw = _readUntrustedUtf16(arg);
+        a.push(JSON.stringify(sw));
+        break;
+      case 'a': // *s
+        const sa = _readUntrustedAnsi(arg);
+        a.push(JSON.stringify(sa));
+        break;
       case 'Z': // *s[i]
         const len = +args[j + 1];
         const str = _readUntrustedUtf8(arg, len);
@@ -2727,7 +2748,11 @@ function formatArgs (args, fmt) {
           if (!arg.isNull()) {
             if (isObjC(arg)) {
               const o = new ObjC.Object(arg);
-              a.push(`${o.$className}: "${o.toString()}"`);
+              if (o.$className === 'Foundation.__NSSwiftData') {
+                a.push(`${o.$className}: "${ObjC.classes.NSString.alloc().initWithData_encoding_(o,4).toString()}"`);
+              } else {
+                a.push(`${o.$className}: "${o.toString()}"`);
+              }
             } else {
               const str = Memory.readCString(arg);
               if (str.length > 2) {
@@ -2793,6 +2818,36 @@ function _readUntrustedUtf8 (address, length) {
   }
 }
 
+function _readUntrustedUtf16 (address, length) {
+  try {
+    if (typeof length === 'number') {
+      return Memory.readUtf16String(ptr(address), length);
+    }
+    return Memory.readUtf16String(ptr(address));
+  } catch (e) {
+    if (e.message !== 'invalid UTF-16') {
+      // TODO: just use this, doo not mess with utf8 imho
+      return Memory.readCString(ptr(address));
+    }
+    return '(invalid utf16)';
+  }
+}
+
+function _readUntrustedAnsi (address, length) {
+  try {
+    if (typeof length === 'number') {
+      return Memory.readAnsiString(ptr(address), length);
+    }
+    return Memory.readAnsiString(ptr(address));
+  } catch (e) {
+    if (e.message !== 'invalid Ansi') {
+      // TODO: just use this, doo not mess with utf8 imho
+      return Memory.readCString(ptr(address));
+    }
+    return '(invalid Ansi)';
+  }
+}
+
 function traceList () {
   let count = 0;
   return traceListeners.map((t) => {
@@ -2810,6 +2865,30 @@ function getPtr (p) {
   }
   if (!p || p === '$$') {
     return ptr(global.r2frida.offset);
+  }
+  if (p.startsWith('swift:')) {
+    if (!SwiftAvailable) {
+      return ptr(0);
+    }
+    // swift:CLASSNAME.method
+    const km = p.substring(6).split('.');
+    if (km.length !== 2) {
+      return ptr(0);
+    }
+    const klass = km[0];
+    const method = km[1];
+    if (!Swift.classes[klass]) {
+      console.error('Missing class ' + klass);
+      return;
+    }
+    const klassDefinition = Swift.classes[klass];
+    let targetAddress = ptr(0);
+    for (const kd of klassDefinition.$methods) {
+      if (method === kd.name) {
+        targetAddress = kd.address;
+      }
+    }
+    return p;
   }
   if (p.startsWith('java:')) {
     return p;
@@ -3131,7 +3210,7 @@ function traceRegs (args) {
   function traceFunction (_) {
     traceListener.hits++;
     const regState = {};
-    rest.map((r) => {
+    rest.forEach((r) => {
       let regName = r;
       let regValue;
       if (r.indexOf('=') !== -1) {
@@ -3238,6 +3317,23 @@ function traceJavaConstructors (className) {
   });
 }
 
+function traceSwift (klass, method) {
+  if (!SwiftAvailable) {
+    return;
+  }
+  const targetAddress = getPtr('swift:' + klass + '.' + method);
+  if (ptr(0).equals(targetAddress)) {
+    console.error('Missing method ' + method + ' in class ' + klass);
+    return;
+  }
+
+  const callback = function (args) {
+    const msg = ['[SWIFT]', klass, method, JSON.stringify(args)];
+    traceEmit(msg.join(' '));
+  };
+  Swift.Interceptor.Attach(target, callback);
+}
+
 function traceJava (klass, method) {
   javaPerform(function () {
     const Throwable = Java.use('java.lang.Throwable');
@@ -3300,6 +3396,164 @@ function traceJson (args) {
       }
     })();
   });
+}
+
+function typesR2 (args) {
+  let res = '';
+  if (SwiftAvailable) {
+    switch (args.length) {
+      case 0:
+        for (const mod in Swift.modules) {
+          res += mod + '\n';
+        }
+        break;
+      case 1:
+        try {
+          const target = args[0];
+          const module = (Swift && Swift.modules) ? Swift.modules[target] : null;
+          if (!module) {
+            throw new Error('No module named like this.');
+          }
+          let m = module.enums;
+          if (m) {
+            for (const e of Object.keys(m)) {
+              res += 'td enum ' + e + ' {';
+              const fields = [];
+              if (m[e].$fields) {
+                for (const f of m[e].$fields) {
+                  fields.push(f.name);
+                }
+              }
+              res += fields.join(', ');
+              res += '}\n';
+            }
+          }
+          m = Swift.modules[target].classes;
+          if (m) {
+            for (const e of Object.keys(m)) {
+              if (m[e].$methods) {
+                for (const f of m[e].$methods) {
+                  const name = f.type + '_' + (f.name ? f.name : f.address);
+                  res += 'f swift.' + target + '.' + e + '.' + name + ' = ' + f.address + '\n';
+                }
+              }
+            }
+          }
+          m = Swift.modules[target].structs;
+          if (m) {
+            for (const e of Object.keys(m)) {
+              res += '"td struct ' + target + '.' + e + ' {';
+              if (m[e].$fields) {
+                for (const f of m[e].$fields) {
+                  res += 'int ' + f.name + ';';
+                  // res += '  ' + f.name + ' ' + f.typeName + '\n';
+                }
+              }
+              res += '}"\n';
+            }
+          }
+        } catch (e) {
+          res += e;
+        }
+        break;
+    }
+  }
+  return res;
+}
+
+function types (args) {
+  if (SwiftAvailable) {
+    return swiftTypes(args);
+  }
+  return '';
+}
+
+function swiftTypes (args) {
+  if (!SwiftAvailable) {
+    return '';
+  }
+  let res = '';
+  switch (args.length) {
+    case 0:
+      for (const mod in Swift.modules) {
+        res += mod + '\n';
+      }
+      break;
+    case 1:
+      try {
+        const target = args[0];
+        const module = (Swift && Swift.modules) ? Swift.modules[target] : null;
+        if (!module) {
+          throw new Error('No module named like this.');
+        }
+        res += 'module ' + target + '\n\n';
+        let m = module.enums;
+        if (m) {
+          for (const e of Object.keys(m)) {
+            if (e.$conformances) {
+              res += '// conforms to ' + (m[e].$conformances.join(', ')) + '\n';
+            }
+            res += 'enum ' + e + ' {\n';
+            if (m[e].$fields) {
+              for (const f of m[e].$fields) {
+                res += '  ' + f.name + ',\n';
+              }
+            }
+            res += '}\n';
+          }
+          res += '\n';
+        }
+        m = Swift.modules[target].classes;
+        if (m) {
+          for (const e of Object.keys(m)) {
+            res += 'class ' + e + ' {\n';
+            if (m[e].$fields) {
+              for (const f of m[e].$fields) {
+                res += '  ' + f.name + ' ' + f.typeName + '\n';
+              }
+            }
+            if (m[e].$methods) {
+              for (const f of m[e].$methods) {
+                const name = f.type + (f.name ? f.name : f.address);
+                res += '  fn ' + name + '() // ' + f.address + '\n';
+              }
+            }
+            res += '}\n';
+          }
+          res += '\n';
+        }
+        m = Swift.modules[target].structs;
+        if (m) {
+          for (const e of Object.keys(m)) {
+            if (e.$conformances) {
+              res += '// conforms to ' + (m[e].$conformances.join(', ')) + '\n';
+            }
+            res += 'struct ' + e + ' {\n';
+            if (m[e].$fields) {
+              for (const f of m[e].$fields) {
+                res += '  ' + f.name + ' ' + f.typeName + '\n';
+              }
+            }
+            res += '}\n';
+          }
+          res += '\n';
+        }
+        m = module.protocols;
+        if (m) {
+          for (const e of Object.keys(m)) {
+            if (m[e].isClassOnly) {
+              res += 'class ';
+            }
+            res += 'protocol ' + e + ' (requires: ' + m[e].numRequirements + ')\n';
+          }
+          res += '\n';
+        }
+      } catch (e) {
+        res += e;
+      }
+      break;
+  }
+  return res;
 }
 
 function trace (args) {
@@ -3384,6 +3638,16 @@ function traceReal (name, addressString) {
   if (arguments.length === 0) {
     return traceList();
   }
+  if (name.startsWith('swift:')) {
+    const km = name.substring(6);
+    const dot = km.lastIndexOf('.');
+    if (dot === -1) {
+      return 'Invalid syntax for swift uri. Use "swift:KLASS.METHOD"';
+    }
+    const klass = km.substring(0, dot);
+    const methd = km.substring(dot + 1);
+    return traceSwift(klass, methd);
+  }
   if (name.startsWith('java:')) {
     const javaName = name.substring(5);
     if (javaUse(javaName)) {
@@ -3396,7 +3660,7 @@ function traceReal (name, addressString) {
         const methd = javaName.substring(dot + 1);
         traceJava(klass, methd);
       } else {
-        console.log('Invalid java method name. Use =!dt java:package.class.method');
+        console.log('Invalid java method name. Use :dt java:package.class.method');
       }
     }
     return;
@@ -3456,16 +3720,22 @@ function clearTrace (args) {
 }
 
 function interceptHelp (args) {
-  return 'Usage: di[f][0,1,-1,s] [addr] : intercept function before/after calling and replace return value\n';
-  'dif0 0x808080  # when program calls this address, dont run the function and return 0\n';
+  return 'Usage: di[0,1,-1,s,v] [addr] : intercepts function method and replace the return value.\n';
+  'di0 0x808080  # when program calls this address, the original function is not called, then return value is replaced.\n';
+  'div java:org.ex.class.method  # when program calls this address, the original function is not called and no value is returned.\n';
 }
 
-/* Intercept function calls *after* calling the original function code */
+function interceptFunHelp (args) {
+  return 'Usage: dif[0,1,-1,s] [addr] [str] [param_types]: intercepts function method, call it, and replace the return value.\n';
+  'dif0 0x808080  # when program calls this address, the original function is called, then return value is replaced.\n';
+  'dif0 java:com.example.MainActivity.method1 int,java.lang.String  # Only with JVM methods. You need to define param_types when overload a Java method.\n';
+  'dis 0x808080 str  #.\n';
+}
 
 function interceptRetJava (klass, method, value) {
   javaPerform(function () {
-    const System = javaUse(klass);
-    System[method].implementation = function (library) {
+    const targetClass = javaUse(klass);
+    targetClass[method].implementation = function (library) {
       const timestamp = new Date();
       if (config.getString('hook.output') === 'json') {
         traceEmit({
@@ -3482,33 +3752,69 @@ function interceptRetJava (klass, method, value) {
         case 0: return false;
         case 1: return true;
         case -1: return -1; // TODO should throw an error?
+        case null: return;
       }
       return value;
     };
   });
 }
 
-function interceptRetJavaExpression (target, value) {
+function interceptFunRetJava (className, methodName, value, paramTypes) {
+  javaPerform(function () {
+    const targetClass = javaUse(className);
+    targetClass[methodName].overload(paramTypes).implementation = function (args) {
+      const timestamp = new Date();
+      if (config.getString('hook.output') === 'json') {
+        traceEmit({
+          source: 'java',
+          class: className,
+          methodName,
+          returnValue: value,
+          timestamp
+        });
+      } else {
+        traceEmit(`[JAVA TRACE][${timestamp}] Intercept return for ${className}:${methodName} with ${value}`);
+      }
+      this[methodName](args);
+      switch (value) {
+        case 0: return false;
+        case 1: return true;
+        case -1: return -1; // TODO should throw an error?
+      }
+      return value;
+    };
+  });
+}
+
+function parseTargetJavaExpression (target) {
   let klass = target.substring('java:'.length);
   const lastDot = klass.lastIndexOf('.');
   if (lastDot !== -1) {
     const method = klass.substring(lastDot + 1);
     klass = klass.substring(0, lastDot);
-    return interceptRetJava(klass, method, value);
+    return [klass, method];
   }
-  return 'Error: Wrong java method syntax';
+  throw new Error('Error: Wrong java method syntax');
 }
 
+/* Intercepts function call and modify the return value without calling the original function code */
 function interceptRet (target, value) {
   if (target.startsWith('java:')) {
-    return interceptRetJavaExpression(target, value);
-  }
-  const p = getPtr(target);
-  Interceptor.attach(p, {
-    onLeave (retval) {
-      retval.replace(ptr(value));
+    try {
+      const java_target = parseTargetJavaExpression(target, value);
+      return interceptRetJava(java_target[0], java_target[1], value);
+    } catch (e) {
+      return e.message;
     }
-  });
+  }
+  const funcPtr = getPtr(target);
+  const useCmd = config.getString('hook.usecmd');
+  Interceptor.replace(funcPtr, new NativeCallback(function () {
+    if (useCmd.length > 0) {
+      console.log('[r2cmd]' + useCmd);
+    }
+    return ptr(value);
+  }, 'pointer', ['pointer']));
 }
 
 function interceptRet0 (args) {
@@ -3536,44 +3842,54 @@ function interceptRet_1 (args) { // eslint-disable-line
   return interceptRet(target, -1);
 }
 
-/* Intercept function calls *before* calling the original function code */
-function interceptFunRet (target, value) {
+function interceptRetVoid (args) { // eslint-disable-line
+  const target = args[0];
+  return interceptRet(target, null);
+}
+
+
+/* Intercept function calls and modify return value after calling the original function code */
+function interceptFunRet (target, value, paramTypes) {
   if (target.startsWith('java:')) {
-    return 'TODO: not yet implemented';
+    const javaTarget = parseTargetJavaExpression(target, value);
+    return interceptFunRetJava(javaTarget[0], javaTarget[1], value, paramTypes);
   }
   const p = getPtr(target);
-  const useCmd = config.getString('hook.usecmd');
-  Interceptor.replace(p, new NativeCallback(function () {
-    if (useCmd.length > 0) {
-      console.log('[r2cmd]' + useCmd);
+  Interceptor.attach(p, {
+    onLeave (retval) {
+      retval.replace(ptr(value));
     }
-    return ptr(value);
-  }, 'pointer', ['pointer']));
+  });
 }
 
 function interceptFunRet0 (args) {
   const target = args[0];
-  return interceptFunRet(target, 0);
+  const paramTypes = args[1];
+  return interceptFunRet(target, 0, paramTypes);
 }
 
 function interceptFunRetString (args) {
   const target = args[0];
-  return interceptFunRet(target, args[1]);
+  const paramTypes = args[2];
+  return interceptFunRet(target, args[1], paramTypes);
 }
 
 function interceptFunRetInt (args) {
   const target = args[0];
-  return interceptFunRet(target, args[1]);
+  const paramTypes = args[2];
+  return interceptFunRet(target, args[1], paramTypes);
 }
 
 function interceptFunRet1 (args) {
   const target = args[0];
-  return interceptFunRet(target, 1);
+  const paramTypes = args[1];
+  return interceptFunRet(target, 1, paramTypes);
 }
 
 function interceptFunRet_1 (args) { // eslint-disable-line
   const target = args[0];
-  return interceptFunRet(target, -1);
+  const paramTypes = args[1];
+  return interceptFunRet(target, -1, paramTypes);
 }
 
 function getenv (name) {
@@ -4264,10 +4580,10 @@ function evalConfigSearch (args) {
   const currentRange = Process.getRangeByAddress(ptr(r2frida.offset));
   const from = currentRange.base;
   const to = from.add(currentRange.size);
-  return `e search.in=raw
+  return `e search.in=range
 e search.from=${from}
 e search.to=${to}
-e anal.in=raw
+e anal.in=range
 e anal.from=${from}
 e anal.to=${to}`;
 }

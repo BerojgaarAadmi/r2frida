@@ -44,6 +44,9 @@ typedef struct {
 	RFPendingCmd * pending_cmd;
 	char *crash_report;
 	RIO *io;
+	RSocket *s;
+	gulong onmsg_handler;
+	gulong ondtc_handler;
 } RIOFrida;
 
 typedef enum {
@@ -130,7 +133,7 @@ static RIOFrida *r_io_frida_new(RIO *io) {
 	}
 
 	rf->cancellable = g_cancellable_new (); // TODO: call cancel() when shutting down
-
+	rf->s = r_socket_new (false);
 	rf->detached = false;
 	rf->detach_reason = 0;
 	rf->io = io;
@@ -181,7 +184,13 @@ static void r_io_frida_free(RIOFrida *rf) {
 	if (!rf) {
 		return;
 	}
-
+	if (rf->script && rf->onmsg_handler) {
+		g_signal_handler_disconnect (rf->script, rf->onmsg_handler);
+	}
+	if (rf->session && rf->ondtc_handler) {
+		g_signal_handler_disconnect (rf->session, rf->ondtc_handler);
+	}
+	r_socket_free (rf->s);
 	free (rf->crash_report);
 	g_clear_object (&rf->crash);
 	g_clear_object (&rf->script);
@@ -201,8 +210,8 @@ static void r_io_frida_free(RIOFrida *rf) {
 	}
 
 	g_object_unref (rf->cancellable);
-
-	R_FREE (rf);
+	memset (rf, 0, sizeof (RIOFrida));
+	free (rf);
 }
 
 static const char *detachReasonAsString(RIOFrida *rf) {
@@ -316,7 +325,8 @@ static RIODesc *__open(RIO *io, const char *pathname, int rw, int mode) {
 			lo->process_specifier = package_name;
 		}
 		// try to resolve it as an app name too
-		char **argv = r_str_argv (lo->process_specifier, NULL);
+		char *a = strdup (lo->process_specifier);
+		char **argv = r_str_argv (a, NULL);
 		if (!argv) {
 			eprintf ("Invalid process specifier\n");
 			goto error;
@@ -326,14 +336,16 @@ static RIODesc *__open(RIO *io, const char *pathname, int rw, int mode) {
 			r_str_argv_free (argv);
 			goto error;
 		}
-		FridaSpawnOptions *options = frida_spawn_options_new ();
 		const int argc = g_strv_length (argv);
+		FridaSpawnOptions *options = frida_spawn_options_new ();
 		if (argc > 1) {
 			frida_spawn_options_set_argv (options, argv, argc);
 		}
+		// frida_spawn_options_set_stdio (options, FRIDA_STDIO_PIPE);
 		rf->pid = frida_device_spawn_sync (rf->device, argv[0], options, rf->cancellable, &error);
 		g_object_unref (options);
 		r_str_argv_free (argv);
+		free (a);
 
 		if (error) {
 			if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
@@ -359,7 +371,7 @@ static RIODesc *__open(RIO *io, const char *pathname, int rw, int mode) {
 	}
 
 	FridaScriptOptions * options = frida_script_options_new ();
-	frida_script_options_set_name (options, "r2io");
+	frida_script_options_set_name (options, "_agent");
 	frida_script_options_set_runtime (options, FRIDA_SCRIPT_RUNTIME_QJS);
 
 	const char *code_buf = NULL;
@@ -392,8 +404,8 @@ static RIODesc *__open(RIO *io, const char *pathname, int rw, int mode) {
 		goto error;
 	}
 
-	g_signal_connect (rf->script, "message", G_CALLBACK (on_message), rf);
-	g_signal_connect (rf->session, "detached", G_CALLBACK (on_detached), rf);
+	rf->onmsg_handler = g_signal_connect (rf->script, "message", G_CALLBACK (on_message), rf);
+	rf->ondtc_handler = g_signal_connect (rf->session, "detached", G_CALLBACK (on_detached), rf);
 
 	frida_script_load_sync (rf->script, rf->cancellable, &error);
 	if (error) {
@@ -408,74 +420,76 @@ static RIODesc *__open(RIO *io, const char *pathname, int rw, int mode) {
 	}
 
 	const char *autocompletions[] = {
-		"!!!=!chcon",
-		"!!!=!eval",
-		"!!!=!e",
-		"!!!=!e/",
-		"!!!=!env",
-		"!!!=!j",
-		"!!!=!i",
-		"!!!=!ii",
-		"!!!=!il",
-		"!!!=!is",
-		"!!!=!isa $flag",
-		"!!!=!iE",
-		"!!!=!iEa $flag",
-		"!!!=!ic",
-		"!!!=!ip",
-		"!!!=!init",
-		"!!!=!fd $flag",
-		"!!!=!dd",
-		"!!!=!ddj",
-		"!!!=!?",
-		"!!!=!?V",
-		"!!!=!/",
-		"!!!=!/i",
-		"!!!=!/ij",
-		"!!!=!/w",
-		"!!!=!/wj",
-		"!!!=!/x",
-		"!!!=!/xj",
-		"!!!=!/v1 $flag",
-		"!!!=!/v2 $flag",
-		"!!!=!/v4 $flag",
-		"!!!=!/v8 $flag",
-		"!!!=!dt $flag",
-		"!!!=!dt- $flag",
-		"!!!=!dt-*",
-		"!!!=!dth",
-		"!!!=!dtq",
-		"!!!=!dtr",
-		"!!!=!dtS",
-		"!!!=!dtSf $flag",
-		"!!!=!dc",
-		"!!!=!di",
-		"!!!=!dii",
-		"!!!=!di0",
-		"!!!=!di1",
-		"!!!=!di-1",
-		"!!!=!dl",
-		"!!!=!dl2",
-		"!!!=!dx",
-		"!!!=!dm",
-		"!!!=!dma",
-		"!!!=!dma-",
-		"!!!=!dmas",
-		"!!!=!dmad",
-		"!!!=!dmal",
-		"!!!=!dmm",
-		"!!!=!dmh",
-		"!!!=!dmhm",
-		"!!!=!dmp $flag",
-		"!!!=!db",
-		"!!!=!dp",
-		"!!!=!dpj",
-		"!!!=!dpt",
-		"!!!=!dr",
-		"!!!=!drj",
-		"!!!=!dk",
-		"!!!=!dkr",
-		"!!!=!. $file",
+		"!!!:chcon",
+		"!!!:eval",
+		"!!!:e",
+		"!!!:e/",
+		"!!!:env",
+		"!!!:j",
+		"!!!:i",
+		"!!!:ii",
+		"!!!:il",
+		"!!!:is",
+		"!!!:isa $flag",
+		"!!!:iE",
+		"!!!:iEa $flag",
+		"!!!:ic",
+		"!!!:ip",
+		"!!!:init",
+		"!!!:fd $flag",
+		"!!!:dd",
+		"!!!:ddj",
+		"!!!:?",
+		"!!!:?V",
+		"!!!:/",
+		"!!!:/i",
+		"!!!:/ij",
+		"!!!:/w",
+		"!!!:/wj",
+		"!!!:/x",
+		"!!!:/xj",
+		"!!!:/v1 $flag",
+		"!!!:/v2 $flag",
+		"!!!:/v4 $flag",
+		"!!!:/v8 $flag",
+		"!!!:dt $flag",
+		"!!!:dt- $flag",
+		"!!!:dt-*",
+		"!!!:dth",
+		"!!!:dtq",
+		"!!!:dtr",
+		"!!!:dtS",
+		"!!!:dtSf $flag",
+		"!!!:dc",
+		"!!!:di",
+		"!!!:dii",
+		"!!!:di0",
+		"!!!:di1",
+		"!!!:di-1",
+		"!!!:dl",
+		"!!!:dl2",
+		"!!!:dx",
+		"!!!:dm",
+		"!!!:dma",
+		"!!!:dma-",
+		"!!!:dmas",
+		"!!!:dmaw",
+		"!!!:dmad",
+		"!!!:dmal",
+		"!!!:dmm",
+		"!!!:dmh",
+		"!!!:dmhm",
+		"!!!:dmp $flag",
+		"!!!:db",
+		"!!!:dp",
+		"!!!:dpj",
+		"!!!:dpt",
+		"!!!:dr",
+		"!!!:drj",
+		"!!!:dk",
+		"!!!:dkr",
+		"!!!:t",
+		"!!!:. $file",
 		NULL
 	};
 	int i;
@@ -499,24 +513,20 @@ error:
 	return NULL;
 }
 
-static int __close(RIODesc *fd) {
-	RIOFrida *rf;
-
+static bool __close(RIODesc *fd) {
 	if (!fd || !fd->data) {
-		return -1;
+		return false;
 	}
-
-	rf = fd->data;
+	RIOFrida *rf = fd->data;
 	rf->detached = true;
 	resume (rf);
 	r_io_frida_free (fd->data);
 	fd->data = NULL;
-
-	return 0;
+	return true;
 }
 
 static int __read(RIO *io, RIODesc *fd, ut8 *buf, int count) {
-	GBytes *bytes;
+	GBytes *bytes = NULL;
 	gsize n;
 
 	r_return_val_if_fail (io && fd && fd->data && buf && count > 0, -1);
@@ -535,7 +545,9 @@ static int __read(RIO *io, RIODesc *fd, ut8 *buf, int count) {
 	}
 
 	gconstpointer data = g_bytes_get_data (bytes, &n);
-	memcpy (buf, data, R_MIN (n, count));
+	if (data && buf) {
+		memcpy (buf, data, R_MIN (n, count));
+	}
 
 	json_object_unref (result);
 	g_bytes_unref (bytes);
@@ -613,71 +625,73 @@ static char *__system_continuation(RIO *io, RIODesc *fd, const char *command) {
 
 	if (!strcmp (command, "help") || !strcmp (command, "h") || !strcmp (command, "?")) {
 		// TODO: move this into the .js
-		io->cb_printf ("r2frida commands available via =! or : prefixes\n"
-		". script                   Run script\n"
-		"  frida-expression         Run given expression inside the agent\n"
-		"/[x][j] <string|hexpairs>  Search hex/string pattern in memory ranges (see search.in=?)\n"
-		"/v[1248][j] value          Search for a value honoring `e cfg.bigendian` of given width\n"
-		"/w[j] string               Search wide string\n"
-		"<space> code..             Evaluate Cycript code\n"
-		"?                          Show this help\n"
-		"?e message                 Show message like ?e but from the agent\n"
-		"?E title message           Show UIAlert dialog with given title and message\n"
-		"?V                         Show target Frida version\n"
-		"chcon file                 Change SELinux context (dl might require this)\n"
-		"d.                         Start the chrome tools debugger\n"
-		"db (<addr>|<sym>)          List or place breakpoint\n"
-		"db- (<addr>|<sym>)|*       Remove breakpoint(s)\n"
-		"dc                         Continue breakpoints or resume a spawned process\n"
-		"dd[j-][fd] ([newfd])       List, dup2 or close filedescriptors (ddj for JSON)\n"
-		"di[0,1,-1] [addr]          Intercept and replace return value of address\n"
-		"dif[0,1,-1] [addr]         Intercept return value of address without executing the function\n"
-		"dk ([pid]) [sig]           Send specific signal to specific pid in the remote system\n"
-		"dkr                        Print the crash report (if the app has crashed)\n"
-		"dl libname                 Dlopen a library (Android see chcon)\n"
-		"dl2 libname [main]         Inject library using Frida's >= 8.2 new API\n"
-		"dlf path                   Load a Framework Bundle (iOS) given its path\n"
-		"dlf- path                  Unload a Framework Bundle (iOS) given its path\n"
-		"dm[.|j|*]                  Show memory regions\n"
-		"dma <size>                 Allocate <size> bytes on the heap, address is returned\n"
-		"dma- (<addr>...)           Kill the allocations at <addr> (or all of them without param)\n"
-		"dmad <addr> <size>         Allocate <size> bytes on the heap, copy contents from <addr>\n"
-		"dmal                       List live heap allocations created with dma[s]\n"
-		"dmas <string>              Allocate a string initiated with <string> on the heap\n"
-		"dmh                        List all heap allocated chunks\n"
-		"dmh*                       Export heap chunks and regions as r2 flags\n"
-		"dmhj                       List all heap allocated chunks in JSON\n"
-		"dmhm                       Show which maps are used to allocate heap chunks\n"
-		"dmm                        List all named squashed maps\n"
-		"dmp <addr> <size> <perms>  Change page at <address> with <size>, protection <perms> (rwx)\n"
-		"dp                         Show current pid\n"
-		"dpt                        Show threads\n"
-		"dr                         Show thread registers (see dpt)\n"
-		"dt (<addr>|<sym>) ..       Trace list of addresses or symbols\n"
-		"dt- (<addr>|<sym>)         Clear trace\n"
-		"dt-*                       Clear all tracing\n"
-		"dt.                        Trace at current offset\n"
-		"dtf <addr> [fmt]           Trace address with format (^ixzO) (see dtf?)\n"
-		"dth (addr|sym)(x:0 y:1 ..) Define function header (z=str,i=int,v=hex barray,s=barray)\n"
-		"dtl[-*] [msg]              debug trace log console, useful to .=!T*\n"
-		"dtr <addr> (<regs>...)     Trace register values\n"
-		"dts[*j] seconds            Trace all threads for given seconds using the stalker\n"
-		"dtsf[*j] [sym|addr]        Trace address or symbol using the stalker (Frida >= 10.3.13)\n"
-		"dxc [sym|addr] [args..]    Call the target symbol with given args\n"
-		"e[?] [a[=b]]               List/get/set config evaluable vars\n"
-		"env [k[=v]]                Get/set environment variable\n"
-		"eval code..                Evaluate Javascript code in agent side\n"
-		"fd[*j] <address>           Inverse symbol resolution\n"
-		"i                          Show target information\n"
-		"iE[*] <lib>                Same as is, but only for the export global ones\n"
-		"ic <class>                 List Objective-C/Android Java classes, or methods of <class>\n"
-		"ii[*]                      List imports\n"
-		"il                         List libraries\n"
-		"ip <protocol>              List Objective-C protocols or methods of <protocol>\n"
-		"is[*] <lib>                List symbols of lib (local and global ones)\n"
-		"isa[*] (<lib>) <sym>       Show address of symbol\n"
-		"j java-expression          Run given expression inside a Java.perform(function(){}) block\n"
-		"r [r2cmd]                  Run r2 command using r_core_cmd_str API call (use 'dl libr2.so)\n"
+		io->cb_printf ("r2frida commands are prefixed with `:` (previously known as =! or \\).\n"
+		":. script                   Run script\n"
+		":  frida-expression         Run given expression inside the agent\n"
+		":/[x][j] <string|hexpairs>  Search hex/string pattern in memory ranges (see search.in=?)\n"
+		":/v[1248][j] value          Search for a value honoring `e cfg.bigendian` of given width\n"
+		":/w[j] string               Search wide string\n"
+		":<space> code..             Evaluate Cycript code\n"
+		":?                          Show this help\n"
+		":?e message                 Show message like ?e but from the agent\n"
+		":?E title message           Show UIAlert dialog with given title and message\n"
+		":?V                         Show target Frida version\n"
+		":chcon file                 Change SELinux context (dl might require this)\n"
+		":d.                         Start the chrome tools debugger\n"
+		":db (<addr>|<sym>)          List or place breakpoint\n"
+		":db- (<addr>|<sym>)|*       Remove breakpoint(s)\n"
+		":dc                         Continue breakpoints or resume a spawned process\n"
+		":dd[j-][fd] ([newfd])       List, dup2 or close filedescriptors (ddj for JSON)\n"
+		":di[0,1,-1,i,s,v] [addr]    Intercepts and replace return value of address without calling the function\n"
+		":dif[0,1,-1,i,s] [addr]     Intercepts return value of address after calling the function\n"
+		":dk ([pid]) [sig]           Send specific signal to specific pid in the remote system\n"
+		":dkr                        Print the crash report (if the app has crashed)\n"
+		":dl libname                 Dlopen a library (Android see chcon)\n"
+		":dl2 libname [main]         Inject library using Frida's >= 8.2 new API\n"
+		":dlf path                   Load a Framework Bundle (iOS) given its path\n"
+		":dlf- path                  Unload a Framework Bundle (iOS) given its path\n"
+		":dm[.|j|*]                  Show memory regions\n"
+		":dma <size>                 Allocate <size> bytes on the heap, address is returned\n"
+		":dma- (<addr>...)           Kill the allocations at <addr> (or all of them without param)\n"
+		":dmad <addr> <size>         Allocate <size> bytes on the heap, copy contents from <addr>\n"
+		":dmal                       List live heap allocations created with dma[s]\n"
+		":dmas <string>              Allocate a string initiated with <string> on the heap\n"
+		":dmaw <string>              Allocate a widechar string initiated with <string> on the heap\n"
+		":dmh                        List all heap allocated chunks\n"
+		":dmh*                       Export heap chunks and regions as r2 flags\n"
+		":dmhj                       List all heap allocated chunks in JSON\n"
+		":dmhm                       Show which maps are used to allocate heap chunks\n"
+		":dmm                        List all named squashed maps\n"
+		":dmp <addr> <size> <perms>  Change page at <address> with <size>, protection <perms> (rwx)\n"
+		":dp                         Show current pid\n"
+		":dpt                        Show threads\n"
+		":dr                         Show thread registers (see dpt)\n"
+		":dt (<addr>|<sym>) ..       Trace list of addresses or symbols\n"
+		":dt- (<addr>|<sym>)         Clear trace\n"
+		":dt-*                       Clear all tracing\n"
+		":dt.                        Trace at current offset\n"
+		":dtf <addr> [fmt]           Trace address with format (^ixzO) (see dtf?)\n"
+		":dth (addr|sym)(x:0 y:1 ..) Define function header (z=str,i=int,v=hex barray,s=barray)\n"
+		":dtl[-*] [msg]              debug trace log console, useful to .:T*\n"
+		":dtr <addr> (<regs>...)     Trace register values\n"
+		":dts[*j] seconds            Trace all threads for given seconds using the stalker\n"
+		":dtsf[*j] [sym|addr]        Trace address or symbol using the stalker (Frida >= 10.3.13)\n"
+		":dxc [sym|addr] [args..]    Call the target symbol with given args\n"
+		":e[?] [a[=b]]               List/get/set config evaluable vars\n"
+		":env [k[=v]]                Get/set environment variable\n"
+		":eval code..                Evaluate Javascript code in agent side\n"
+		":fd[*j] <address>           Inverse symbol resolution\n"
+		":i                          Show target information\n"
+		":iE[*] <lib>                Same as is, but only for the export global ones\n"
+		":ic <class>                 List Objective-C/Android Java classes, or methods of <class>\n"
+		":ii[*]                      List imports\n"
+		":il                         List libraries\n"
+		":ip <protocol>              List Objective-C protocols or methods of <protocol>\n"
+		":is[*] <lib>                List symbols of lib (local and global ones)\n"
+		":isa[*] (<lib>) <sym>       Show address of symbol\n"
+		":j java-expression          Run given expression inside a Java.perform(function(){}) block\n"
+		":r [r2cmd]                  Run r2 command using r_core_cmd_str API call (use 'dl libr2.so)\n"
+		":t [swift-module-name]      Show structs, enums, classes and protocols for a module (see swift: prefix)\n"
 		);
 		return NULL;
 	}
@@ -704,7 +718,7 @@ static char *__system_continuation(RIO *io, RIODesc *fd, const char *command) {
 	}
 
 	if (!strcmp (command, "")) {
-		r_core_cmd0 (rf->r2core, ".=!i*");
+		r_core_cmd0 (rf->r2core, ".:i*");
 		return NULL;
 	} else if (!strncmp (command, "o/", 2)) {
 		r_core_cmd0 (rf->r2core, "?E Yay!");
@@ -731,6 +745,8 @@ static char *__system_continuation(RIO *io, RIODesc *fd, const char *command) {
 		io->cb_printf ("  c  = show value as a string (char)\n");
 		io->cb_printf ("  i  = show decimal argument\n");
 		io->cb_printf ("  z  = show pointer to string\n");
+		io->cb_printf ("  w  = show pointer to UTF-16 string\n");
+		io->cb_printf ("  a  = show pointer to ANSI string\n");
 		io->cb_printf ("  h  = hexdump from pointer (optional length, h16 to dump 16 bytes)\n");
 		io->cb_printf ("  H  = hexdump from pointer (optional position of length argument, H1 to dump args[1] bytes)\n");
 		io->cb_printf ("  s  = show string in place\n");
@@ -908,7 +924,9 @@ static void load_scripts(RCore *core, RIODesc *fd, const char *path) {
 	r_list_foreach (files, iter, file) {
 		if (r_str_endswith (file, ".js")) {
 			char *cmd = r_str_newf (". %s"R_SYS_DIR"%s", path, file);
-			eprintf ("Loading %s\n", file);
+			if (r2f_debug()) {
+				eprintf ("Loading %s\n", file);
+			}
 			char * s = __system_continuation (core->io, fd, cmd);
 			free (cmd);
 			if (s) {
@@ -1123,9 +1141,17 @@ static bool resolve4(RList *args, R2FridaLaunchOptions *lo, GCancellable *cancel
 	R2FridaLink link = parse_link (arg1);
 
 	GError *error = NULL;
-	const char *devid = R_STR_ISEMPTY(arg1)? NULL: arg1;
-	if (link == R2F_LINK_REMOTE) {
+	const char *devid = R_STR_ISNOTEMPTY (arg2)? arg2: NULL;
+	switch (link) {
+	case R2F_LINK_USB:
+		devid = R_STR_ISNOTEMPTY (arg2)? arg2: "usb";
+		break;
+	case R2F_LINK_REMOTE:
 		devid = arg2;
+		break;
+	default:
+		devid = NULL;
+		break;
 	}
 	FridaDevice *device = get_device_manager (device_manager, devid, cancellable, &error);
 
@@ -1134,18 +1160,20 @@ static bool resolve4(RList *args, R2FridaLaunchOptions *lo, GCancellable *cancel
 	case R2F_ACTION_UNKNOWN:
 		break;
 	case R2F_ACTION_LIST_APPS:
-		if (!device) { 
+		if (device) {
+			if (!dumpApplications (device, cancellable)) {
+				eprintf ("Cannot enumerate apps\n");
+			}
+		} else {
 			eprintf ("Cannot find peer.\n"); 
-		}
-		if (!dumpApplications (device, cancellable)) {
-			eprintf ("Cannot enumerate apps\n");
 		}
 		break;
 	case R2F_ACTION_LIST_PIDS:
-		if (!device) {
+		if (device) {
+			dumpProcesses (device, cancellable);
+		} else {
 			eprintf ("Cannot find peer.\n");
 		}
-		dumpProcesses (device, cancellable);
 		break;
 	case R2F_ACTION_LAUNCH:
 	case R2F_ACTION_SPAWN:
@@ -1165,7 +1193,7 @@ static bool resolve4(RList *args, R2FridaLaunchOptions *lo, GCancellable *cancel
 			lo->run = action == R2F_ACTION_LAUNCH;
 			lo->pid = -1;
 			if (link == R2F_LINK_USB) {
-				lo->device_id = strdup ("usb");
+				lo->device_id = strdup (devid);
 			} else {
 				lo->device_id = strdup (arg2);
 			}
@@ -1466,6 +1494,9 @@ static void on_stanza(RIOFrida *rf, JsonObject *stanza, GBytes *bytes) {
 
 static void on_detached(FridaSession *session, FridaSessionDetachReason reason, FridaCrash *crash, gpointer user_data) {
 	RIOFrida *rf = user_data;
+	if (!rf || !rf->io) {
+		return;
+	}
 	rf->detached = true;
 	rf->detach_reason = reason;
 	eprintf ("DetachReason: %s\n", detachReasonAsString (rf));
@@ -1531,9 +1562,15 @@ static void on_message(FridaScript *script, const char *raw_message, GBytes *dat
 					if (stanza) {
 						JsonNode *message_node = json_object_get_member (stanza, "message");
 						JsonNodeType type = json_node_get_node_type (message_node);
-						char *message = (type == JSON_NODE_OBJECT)
-							? json_to_string (message_node, FALSE)
-							: strdup (json_object_get_string_member (stanza, "message"));
+						char *message = NULL;
+						if (type == JSON_NODE_OBJECT) {
+							message = json_to_string (message_node, FALSE);
+						} else {
+							const char *cmessage = json_object_get_string_member (stanza, "message");
+							if (cmessage) {
+								message = strdup (cmessage);
+							}
+						}
 						if (message) {
 							eprintf ("%s\n", message);
 							free (message);
@@ -1550,7 +1587,31 @@ static void on_message(FridaScript *script, const char *raw_message, GBytes *dat
 							: strdup (json_object_get_string_member (stanza, "message"));
 						message = r_str_append (message, "\n");
 						if (filename && message) {
-							(void) r_file_dump (filename, (const ut8*)message, -1, true);
+							bool sent = false;
+							if (*filename == '|') {
+								// redirect the message to a program shell
+								char *emsg = r_str_escape (message);
+								r_sys_cmdf ("%s \"%s\"", r_str_trim_head_ro (filename + 1), emsg);
+								free (emsg);
+							} else if (r_str_startswith (filename, "tcp:")) {
+								char *host = strdup (filename + 4);
+								char *port = strchr (host, ':');
+								if (port) {
+									*port++ = 0;
+									if (!r_socket_is_connected (rf->s)) {
+										(void)r_socket_connect (rf->s, host, port, R_SOCKET_PROTO_TCP, 0);
+									}
+									if (r_socket_is_connected (rf->s)) {
+										size_t msglen = strlen (message);
+										if (r_socket_write (rf->s, message, msglen) == msglen) {
+											sent = true;
+										}
+									}
+								}
+							}
+							if (!sent) {
+								(void) r_file_dump (filename, (const ut8*)message, -1, true);
+							}
 						}
 						free (message);
 						// json_node_unref (stanza_node);
@@ -1652,7 +1713,7 @@ static char *resolve_package_name_by_process_name(FridaDevice *device, GCancella
 	num_applications = frida_application_list_size (list);
 
 	applications = g_array_sized_new (FALSE, FALSE, sizeof (FridaApplication *), num_applications);
-	for (i = 0; i != num_applications; i++) {
+	for (i = 0; i < num_applications; i++) {
 		FridaApplication *application = frida_application_list_get (list, i);
 		if (application) {
 			const char *name = frida_application_get_name (application);
@@ -1822,6 +1883,7 @@ static gint computeDeviceScore(FridaDevice *device) {
 	case FRIDA_DEVICE_TYPE_REMOTE:
 		return 1;
 	}
+	return 0;
 }
 
 static int atopid(const char *maybe_pid, bool *valid) {
@@ -1894,7 +1956,7 @@ error:
 
 RIOPlugin r_io_plugin_frida = {
 	.name = "frida",
-	.desc = "frida:// io plugin",
+	.desc = "io plugin for Frida " FRIDA_VERSION_STRING,
 	.uris = "frida://",
 	.license = "MIT",
 	.open = __open,

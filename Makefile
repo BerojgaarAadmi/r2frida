@@ -1,7 +1,9 @@
 include config.mk
 
 r2_version=$(VERSION)
-frida_version=15.0.16
+frida_version=15.1.12
+
+CFLAGS+=-DFRIDA_VERSION_STRING=\"${frida_version}\"
 
 ifeq ($(strip $(frida_os)),)
 ifeq ($(shell uname -o 2> /dev/null),Android)
@@ -54,7 +56,7 @@ CXXFLAGS+=$(CFLAGS)
 
 USE_ASAN?=0
 ifeq ($(USE_ASAN),1)
-ASAN_CFLAGS=-fsanitize=address,integer,undefined
+ASAN_CFLAGS=-fsanitize=address,undefined,signed-integer-overflow,integer-divide-by-zero
 ASAN_LDFLAGS=$(ASAN_CFLAGS)
 CFLAGS+=$(ASAN_CFLAGS)
 LDFLAGS+=$(ASAN_LDFLAGS)
@@ -136,9 +138,6 @@ asan:
 	$(MAKE) USE_ASAN=1
 
 
-ext/swift-frida/index.js: .gitmodules node_modules
-	git submodule update --init
-
 ext/frida: $(FRIDA_SDK)
 	[ "`readlink ext/frida`" = frida-$(frida_os)-$(frida_version) ] || \
 		(cd ext && rm -f frida ; ln -fs frida-$(frida_os)-$(frida_version) frida)
@@ -155,9 +154,6 @@ src/io_frida.o: src/io_frida.c $(FRIDA_SDK) src/_agent.h
 
 .git/modules/ext:
 	git submodule update --init
-
-ext/swift-frida/node_modules: ext/swift-frida/index.js ext/swift-frida/index.js
-	cd ext/swift-frida && npm i
 
 src/_agent.h: src/_agent.js
 	r2 -nfqcpc $< | grep 0x > $@
